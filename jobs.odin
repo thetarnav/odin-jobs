@@ -166,21 +166,18 @@ _job_raw :: proc (
 
 	context = state.ctx
 
-	append_nothing(&state.jobs)
-	job := &state.jobs[len(state.jobs)-1]
+	id := Job_Id(len(state.jobs)+1)
+	append(&state.jobs, {
+		id          = id,
+		procedure   = procedure,
+		dispatch    = dispatch,
+		data_buff   = data_buff,
+		data_size   = data_size,
+		result_size = result_size,
+		state       = .Ready,
+	})
 
-	job.procedure   = procedure
-	job.data_size   = data_size
-	job.result_size = result_size
-	job.dispatch    = dispatch
-
-	if data_size > 0 {
-		runtime.mem_copy(&job.data_buff, &data_buff, data_size)
-	}
-
-	sync.atomic_store(&job.state, .Ready)
-
-	return {id=job.id}
+	return {id=id}
 }
 
 _job_execute :: proc (job: ^Job_Internal) -> bool {
