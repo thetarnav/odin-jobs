@@ -12,6 +12,7 @@ Job :: struct ($R: typeid) where size_of(R) <= size_of([2]u64) {
 }
 
 Job_Internal :: struct {
+	generation:  int,
 	procedure:   rawptr,
 	dispatch:    proc (^Job_Internal),
 	data_buff:   [2]u64,
@@ -19,9 +20,10 @@ Job_Internal :: struct {
 	data_size:   u8,
 	result_size: u8,
 	state:       Job_State, // atomic
+	to_release:  bool,
 }
 
-Job_State :: enum u8 {Init, Ready, Running, Finished}
+Job_State :: enum u8 {Init, Ready, Running, Finished, Released}
 
 Jobs_State :: struct {
 	ctx:     runtime.Context,
@@ -44,7 +46,7 @@ init :: proc (state: ^Jobs_State, allocator := context.allocator, loc := #caller
 }
 fini :: proc (state: ^Jobs_State) {
 	for _, &j in state.jobs {
-		_job_execute(&j)
+		_job_execute(state, &j)
 	}
 	sync.atomic_store(&state.done, true)
 	for &t in state.threads {
@@ -88,6 +90,13 @@ wait :: proc (state: ^Jobs_State, id: Job($R)) -> (res: R, found: bool) #optiona
 	return
 }
 
+release :: proc (state: ^Jobs_State, job: Job($R)) {
+	_job_key_release(state, auto_cast job)
+}
+invalidate :: proc (state: ^Jobs_State, job: Job($R)) {
+	_job_key_invalidate(state, auto_cast job)
+}
+
 _thread_proc :: proc () {
 	state := cast(^Jobs_State)context.user_ptr
 	// t := &state.threads[context.user_index]
@@ -100,7 +109,7 @@ _thread_proc :: proc () {
 
 _do_work :: proc (state: ^Jobs_State) {
 	for _, &j in state.jobs {
-		_job_execute(&j) or_continue
+		_job_execute(state, &j) or_continue
 		break
 	}
 }
@@ -128,6 +137,46 @@ _job_dispatch_proc :: proc ($D, $R: typeid) -> proc (^Job_Internal) {
 	}
 }
 
+_job_execute :: proc (state: ^Jobs_State, job: ^Job_Internal) -> bool {
+	genration := sync.atomic_load(&job.generation)
+	sync.atomic_compare_exchange_strong(&job.state, .Ready, .Running) or_return
+	context = state.ctx
+	job->dispatch()
+	if genration == sync.atomic_load(&job.generation) {
+		sync.atomic_store(&job.state, .Finished)
+	} else if job.to_release {
+		delete_key(&state.jobs, _job_key(job^))
+	}
+	return true
+}
+
+_job_key_release :: proc (state: ^Jobs_State, id: Job(rawptr)) {
+	if job, in_cache := (&state.jobs[id]); in_cache {
+		_job_release(state, job)
+	}
+}
+_job_release :: proc (state: ^Jobs_State, job: ^Job_Internal) {
+	job.to_release = true
+	if _, finished := sync.atomic_compare_exchange_strong(&job.state, .Finished, .Released); finished {
+		delete_key(&state.jobs, _job_key(job^))
+	}
+}
+
+_job_key_invalidate :: proc (state: ^Jobs_State, id: Job(rawptr)) {
+	if job, in_cache := (&state.jobs[id]); in_cache {
+		_job_invalidate(state, job)
+	}
+}
+_job_invalidate :: proc (state: ^Jobs_State, job: ^Job_Internal) {
+	sync.atomic_add(&job.generation, 1)
+	job.to_release = true
+	if _, finished := sync.atomic_compare_exchange_strong(&job.state, .Finished, .Released); finished {
+		delete_key(&state.jobs, _job_key(job^))
+	} else if _, ready := sync.atomic_compare_exchange_strong(&job.state, .Ready, .Released); ready {
+		delete_key(&state.jobs, _job_key(job^))
+	}
+}
+
 _job_key :: proc (job: Job_Internal) -> Job(rawptr) {
 	return Job(rawptr){job.procedure, job.data_buff, job.data_size}
 }
@@ -144,13 +193,11 @@ _job_raw :: proc (
 		runtime.mem_copy_non_overlapping(&data_buff, data, int(data_size))
 	}
 
-	for id, job in state.jobs {
-		if id != {procedure, data_buff, data_size} do continue
+	if job, cached := (&state.jobs[{procedure, data_buff, data_size}]); cached {
 		assert(job.result_size == result_size)
-		return id
+		job.to_release = false
+		return {procedure, data_buff, data_size}
 	}
-
-	context = state.ctx
 
 	job := Job_Internal{
 		procedure   = procedure,
@@ -165,34 +212,22 @@ _job_raw :: proc (
 	return _job_key(job)
 }
 
-_job_execute :: proc (job: ^Job_Internal) -> bool {
-	sync.atomic_compare_exchange_strong(&job.state, .Ready, .Running) or_return
-	job->dispatch()
-	sync.atomic_store(&job.state, .Finished)
-	return true
-}
-
 _wait_raw :: proc (
 	state: ^Jobs_State, id: Job(rawptr), res: rawptr,
 ) -> (found: bool) {
-	for job_id, &job in state.jobs {
-		if job_id != id do continue
+	job := (&state.jobs[id]) or_return
 
-		if sync.atomic_load(&job.state) != .Finished {
-			if !_job_execute(&job) {
-				for sync.atomic_load(&job.state) != .Finished {
-					_do_work(state)
-				}
+	if sync.atomic_load(&job.state) != .Finished {
+		if !_job_execute(state, job) {
+			for sync.atomic_load(&job.state) != .Finished {
+				_do_work(state)
 			}
 		}
-
-		if job.result_size > 0 {
-			runtime.mem_copy_non_overlapping(res, &job.result_buff, int(job.result_size))
-		}
-		return true
 	}
 
-	// Not found
-	return false
+	if job.result_size > 0 {
+		runtime.mem_copy_non_overlapping(res, &job.result_buff, int(job.result_size))
+	}
+	return true
 }
 
