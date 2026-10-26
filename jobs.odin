@@ -1,19 +1,9 @@
 package odin_jobs
 
+import "base:runtime"
 import "core:sync"
 import "core:os"
 import "core:thread"
-import "base:runtime"
-
-// - Jobs take data and procedure
-// - data and procedure are hashed
-// - created jobs are cached with that hash
-// - jobs can be manually invalidated to remove them from the cache
-//   or it could be a lru cache
-// - data must be allocated and copied if larger than a pointer
-//   and it can be freed when the job finishes
-// - result if larger than a pointer must be allocated as well
-//   it must be alive as long as the job is in the cache
 
 Job :: struct ($D, $R: typeid)
 	where size_of(D) <= size_of([2]u64),
