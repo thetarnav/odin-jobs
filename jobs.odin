@@ -26,14 +26,14 @@ Job :: struct ($D, $R: typeid)
 Job_Internal :: struct {
 	procedure:   rawptr,
 	dispatch:    proc (^Job_Internal),
-	state:       Job_State, // atomic
 	data_buff:   [2]u64,
 	result_buff: [2]u64,
 	data_size:   u8,
 	result_size: u8,
+	state:       Job_State, // atomic
 }
 
-Job_State :: enum {Init, Ready, Running, Finished}
+Job_State :: enum u8 {Init, Ready, Running, Finished}
 
 Jobs_State :: struct {
 	ctx:     runtime.Context,
