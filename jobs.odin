@@ -166,13 +166,10 @@ _job_raw :: proc (
 }
 
 _job_execute :: proc (job: ^Job_Internal) -> bool {
-	if sync.atomic_load(&job.state) == .Ready {
-		sync.atomic_store(&job.state, .Running)
-		job->dispatch()
-		sync.atomic_store(&job.state, .Finished)
-		return true
-	}
-	return false
+	sync.atomic_compare_exchange_strong(&job.state, .Ready, .Running) or_return
+	job->dispatch()
+	sync.atomic_store(&job.state, .Finished)
+	return true
 }
 
 _wait_raw :: proc (
