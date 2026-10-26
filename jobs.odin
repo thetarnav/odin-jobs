@@ -4,57 +4,98 @@ import "base:runtime"
 import "core:sync"
 import "core:os"
 import "core:thread"
+import hm "core:container/handle_map"
+import "core:container/queue"
 
 Job :: struct ($R: typeid) where size_of(R) <= size_of([2]u64) {
-	procedure: rawptr,
-	data_buff: [2]u64,
-	data_size: u8,
+	idx, gen: u32,
 }
 
 Job_Internal :: struct {
-	generation:  int,
-	procedure:   rawptr,
-	dispatch:    proc (^Job_Internal),
-	data_buff:   [2]u64,
-	result_buff: [2]u64,
-	data_size:   u8,
-	result_size: u8,
-	state:       Job_State, // atomic
-	to_release:  bool,
+	using handle: Job(rawptr),
+	procedure:    rawptr,
+	dispatch:     proc (^Job_Internal),
+	data_buff:    [2]u64,
+	result_buff:  [2]u64,
+	data_size:    u8,
+	result_size:  u8,
+	state:        Job_State,
+	cached:       bool,
+	to_release:   bool,
+	invalidated:  bool,
+	waiters:      int,
 }
 
 Job_State :: enum u8 {Init, Ready, Running, Finished, Released}
 
 Jobs_State :: struct {
-	ctx:     runtime.Context,
-	mutex:   sync.Mutex,
-	jobs:    map[Job(rawptr)]Job_Internal,
-	threads: []^thread.Thread,
-	done:    bool, // atomic
+	ctx:             runtime.Context,
+	mutex:           sync.Mutex,
+	jobs:            hm.Dynamic_Handle_Map(Job_Internal, Job(rawptr)),
+	ready:           queue.Queue(Job(rawptr)),
+	work_available:  sync.Sema,
+	job_changed:     sync.Cond,
+	threads:         []^thread.Thread,
+	outstanding:     int, // Ready + Running; protected by mutex
+	done:            bool, // atomic
 }
 
 init :: proc (state: ^Jobs_State, allocator := context.allocator, loc := #caller_location) {
+	state.ctx         = context
+	state.done        = false
+	state.outstanding = 0
 
-	state.ctx     = context
-	state.jobs    = make(map[Job(rawptr)]Job_Internal, 1000, allocator, loc)
-	state.threads = make([]^thread.Thread, os.get_processor_core_count()-1, allocator, loc)
+	hm.dynamic_init(&state.jobs, allocator)
+	if err := queue.init(&state.ready, 64, allocator, loc); err != nil {
+		panic("odin_jobs: failed to initialize ready queue")
+	}
+
+	worker_count := max(os.get_processor_core_count()-1, 0)
+	state.threads = make([]^thread.Thread, worker_count, allocator, loc)
 
 	context.user_ptr = state
 	for &t, i in state.threads {
 		context.user_index = i
 		t = thread.create_and_start(_thread_proc, context)
+		assert(t != nil, "odin_jobs: failed to start worker thread")
 	}
 }
+
 fini :: proc (state: ^Jobs_State) {
-	for _, &j in state.jobs {
-		_job_execute(state, &j)
+	// Help drain ready work. If all outstanding jobs are running elsewhere,
+	// sleep until one completes or enqueues more work.
+	for {
+		sync.lock(&state.mutex)
+		handle, _, got_job := _claim_next_locked(state)
+		if got_job {
+			sync.unlock(&state.mutex)
+			_job_run(state, handle)
+			continue
+		}
+
+		if state.outstanding == 0 {
+			sync.atomic_store(&state.done, true)
+			sync.unlock(&state.mutex)
+			break
+		}
+
+		sync.cond_wait(&state.job_changed, &state.mutex)
+		sync.unlock(&state.mutex)
 	}
-	sync.atomic_store(&state.done, true)
+
+	// Wake idle workers so they can observe done and exit. Never join while
+	// holding the scheduler mutex.
+	if len(state.threads) > 0 {
+		sync.sema_post(&state.work_available, len(state.threads))
+	}
 	for &t in state.threads {
 		thread.destroy(t)
 	}
+
 	delete(state.threads)
-	delete(state.jobs)
+	state.threads = nil
+	queue.destroy(&state.ready)
+	hm.dynamic_destroy(&state.jobs)
 }
 
 job_data_result :: proc (
@@ -92,31 +133,77 @@ wait :: proc (state: ^Jobs_State, id: Job($R)) -> (res: R, found: bool) #optiona
 }
 
 release :: proc (state: ^Jobs_State, job: Job($R)) {
-	_job_key_release(state, auto_cast job)
+	_job_release_handle(state, auto_cast job)
 }
 invalidate :: proc (state: ^Jobs_State, job: Job($R)) {
-	_job_key_invalidate(state, auto_cast job)
+	_job_invalidate_handle(state, auto_cast job)
 }
 
 _thread_proc :: proc () {
 	state := cast(^Jobs_State)context.user_ptr
-	// t := &state.threads[context.user_index]
-
-	for sync.atomic_load(&state.done) == false {
-		_do_work(state)
-		thread.yield()
-	}
-}
-
-_do_work :: proc (state: ^Jobs_State) {
-	sync.lock(&state.mutex)
-	for _, &job in state.jobs {
-		if sync.atomic_load(&job.state) == .Ready {
-			sync.unlock(&state.mutex)
-			_job_execute(state, &job)
+	for {
+		sync.sema_wait(&state.work_available)
+		if _do_work(state) {
+			continue
+		}
+		if sync.atomic_load(&state.done) {
 			return
 		}
 	}
+}
+
+_do_work :: proc (state: ^Jobs_State) -> bool {
+	sync.lock(&state.mutex)
+	handle, _, got_job := _claim_next_locked(state)
+	sync.unlock(&state.mutex)
+	if got_job {
+		_job_run(state, handle)
+	}
+	return got_job
+}
+
+_claim_next_locked :: proc (state: ^Jobs_State) -> (handle: Job(rawptr), job: ^Job_Internal, got_job: bool) {
+	for queue.len(state.ready) > 0 {
+		handle = queue.pop_front(&state.ready)
+		job = hm.dynamic_get(&state.jobs, handle) or_continue
+		if job.state != .Ready || job.invalidated {
+			continue
+		}
+		job.state = .Running
+		got_job = true
+		return
+	}
+	return
+}
+
+_job_run :: proc (state: ^Jobs_State, handle: Job(rawptr)) {
+	// A running slot is not reclaimed or reused until this procedure publishes
+	// completion, so the handle continues to resolve throughout dispatch.
+	sync.lock(&state.mutex)
+	job, valid := hm.dynamic_get(&state.jobs, handle)
+	assert(valid && job.state == .Running)
+	sync.unlock(&state.mutex)
+
+	context = state.ctx
+	job->dispatch()
+
+	sync.lock(&state.mutex)
+	job, valid = hm.dynamic_get(&state.jobs, handle)
+	assert(valid && job.state == .Running)
+
+	state.outstanding -= 1
+	if job.invalidated {
+		job.state = .Released
+		job.cached = false
+	} else {
+		job.state = .Finished
+		if job.to_release {
+			job.cached = false
+		}
+	}
+
+	_maybe_reclaim_locked(state, handle, job)
+	sync.cond_broadcast(&state.job_changed)
 	sync.unlock(&state.mutex)
 }
 
@@ -143,65 +230,64 @@ _job_dispatch_proc :: proc ($D, $R: typeid) -> proc (^Job_Internal) {
 	}
 }
 
-_job_execute :: proc (state: ^Jobs_State, job: ^Job_Internal) -> bool {
-	genration := sync.atomic_load(&job.generation)
-	sync.atomic_compare_exchange_strong(&job.state, .Ready, .Running) or_return
-
-	context = state.ctx
-	job->dispatch()
-
-	if genration == sync.atomic_load(&job.generation) {
-		sync.atomic_store(&job.state, .Finished)
-	} else if sync.atomic_load(&job.to_release) {
-		sync.atomic_store(&job.state, .Released)
-		_job_remove(state, _job_key(job^))
-	}
-	return true
-}
-
-_job_key_release :: proc (state: ^Jobs_State, id: Job(rawptr)) {
-	if job, in_cache := _job_get(state, id); in_cache {
-		_job_release(state, job)
-	}
-}
-_job_release :: proc (state: ^Jobs_State, job: ^Job_Internal) {
-	sync.atomic_store(&job.to_release, true)
-	if _, finished := sync.atomic_compare_exchange_strong(&job.state, .Finished, .Released); finished {
-		_job_remove(state, _job_key(job^))
-	}
-}
-
-_job_key_invalidate :: proc (state: ^Jobs_State, id: Job(rawptr)) {
-	if job, in_cache := _job_get(state, id); in_cache {
-		_job_invalidate(state, job)
-	}
-}
-_job_invalidate :: proc (state: ^Jobs_State, job: ^Job_Internal) {
-	sync.atomic_add(&job.generation, 1)
-	sync.atomic_store(&job.to_release, true)
-	if _, finished := sync.atomic_compare_exchange_strong(&job.state, .Finished, .Released); finished {
-		_job_remove(state, _job_key(job^))
-	} else if _, ready := sync.atomic_compare_exchange_strong(&job.state, .Ready, .Released); ready {
-		_job_remove(state, _job_key(job^))
-	}
-}
-
-_job_get :: proc (state: ^Jobs_State, id: Job(rawptr)) -> (^Job_Internal, bool) {
+_job_release_handle :: proc (state: ^Jobs_State, handle: Job(rawptr)) {
 	sync.guard(&state.mutex)
-	return &state.jobs[id]
-}
-_job_add :: proc (state: ^Jobs_State, job: Job_Internal) -> Job(rawptr) {
-	sync.guard(&state.mutex)
-	state.jobs[_job_key(job)] = job
-	return _job_key(job)
-}
-_job_remove :: proc (state: ^Jobs_State, id: Job(rawptr)) {
-	sync.guard(&state.mutex)
-	delete_key(&state.jobs, id)
+	if job, valid := hm.dynamic_get(&state.jobs, handle);
+	   valid && job.cached && !job.invalidated {
+		job.to_release = true
+		if job.state == .Finished {
+			job.cached = false
+			_maybe_reclaim_locked(state, handle, job)
+		}
+	}
+	sync.cond_broadcast(&state.job_changed)
 }
 
-_job_key :: proc (job: Job_Internal) -> Job(rawptr) {
-	return Job(rawptr){job.procedure, job.data_buff, job.data_size}
+_job_invalidate_handle :: proc (state: ^Jobs_State, handle: Job(rawptr)) {
+	sync.guard(&state.mutex)
+	if job, valid := hm.dynamic_get(&state.jobs, handle);
+	   valid && job.cached && !job.invalidated {
+		job.invalidated = true
+		job.cached = false
+		job.to_release = true
+		if job.state == .Ready {
+			job.state = .Released
+			state.outstanding -= 1
+		} else if job.state == .Finished {
+			job.state = .Released
+		}
+		_maybe_reclaim_locked(state, handle, job)
+	}
+	sync.cond_broadcast(&state.job_changed)
+}
+
+_find_key_locked :: proc (
+	state: ^Jobs_State,
+	procedure: rawptr,
+	data_buff: [2]u64,
+	data_size: u8,
+) -> (handle: Job(rawptr), job: ^Job_Internal, found: bool) {
+	it := hm.dynamic_iterator_make(&state.jobs)
+	for {
+		slot, h := hm.dynamic_iterate(&it) or_break
+		if slot.cached && !slot.invalidated &&
+		   slot.procedure == procedure &&
+		   slot.data_buff == data_buff &&
+		   slot.data_size == data_size {
+			return h, slot, true
+		}
+	}
+	return
+}
+
+_maybe_reclaim_locked :: proc (state: ^Jobs_State, handle: Job(rawptr), job: ^Job_Internal) {
+	if job.cached || job.waiters != 0 || job.state == .Running || job.handle.idx == 0 {
+		return
+	}
+	job.state = .Released
+	removed, err := hm.dynamic_remove(&state.jobs, handle)
+	assert(err == nil, "odin_jobs: failed to release job slot")
+	assert(removed, "odin_jobs: job slot was already released")
 }
 
 _job_raw :: proc (
@@ -216,38 +302,87 @@ _job_raw :: proc (
 		runtime.mem_copy_non_overlapping(&data_buff, data, int(data_size))
 	}
 
-	if job, cached := _job_get(state, {procedure, data_buff, data_size}); cached {
-		assert(job.result_size == result_size)
-		sync.atomic_store(&job.to_release, false)
-		return {procedure, data_buff, data_size}
+	sync.guard(&state.mutex)
+
+	assert(!sync.atomic_load(&state.done), "odin_jobs: submitting a job after fini")
+	if cached_handle, cached_job, cached := _find_key_locked(state, procedure, data_buff, data_size); cached {
+		cached_job.to_release = false
+		return cached_handle
 	}
 
-	return _job_add(state, {
+	entry := Job_Internal{
 		procedure   = procedure,
 		dispatch    = dispatch,
 		data_buff   = data_buff,
 		data_size   = data_size,
 		result_size = result_size,
 		state       = .Ready,
-	})
+		cached      = true,
+	}
+	handle, err := hm.dynamic_add(&state.jobs, entry)
+	assert(err == nil, "odin_jobs: failed to allocate job slot")
+
+	slot, valid := hm.dynamic_get(&state.jobs, handle)
+	assert(valid)
+
+	slot.handle = handle
+	ok, queue_err := queue.push_back(&state.ready, handle)
+	assert(ok && queue_err == nil, "odin_jobs: failed to enqueue job")
+
+	state.outstanding += 1
+
+	sync.sema_post(&state.work_available)
+	return handle
 }
 
 _wait_raw :: proc (
-	state: ^Jobs_State, id: Job(rawptr), res: rawptr,
+	state: ^Jobs_State, handle: Job(rawptr), res: rawptr,
 ) -> (found: bool) {
-	job := _job_get(state, id) or_return
 
-	if sync.atomic_load(&job.state) < .Finished {
-		if !_job_execute(state, job) {
-			for sync.atomic_load(&job.state) < .Finished {
-				_do_work(state)
-			}
+	sync.guard(&state.mutex)
+
+	initial_job := hm.dynamic_get(&state.jobs, handle) or_return
+	if !initial_job.cached || initial_job.invalidated {
+		return false
+	}
+	initial_job.waiters += 1
+
+	for {
+		job, valid := hm.dynamic_get(&state.jobs, handle)
+		if !valid || job.invalidated || job.state == .Released {
+			found = false
+			break
 		}
+		if job.state == .Finished {
+			if job.result_size > 0 {
+				runtime.mem_copy_non_overlapping(res, &job.result_buff, int(job.result_size))
+			}
+			found = true
+			break
+		}
+		if job.state == .Ready {
+			job.state = .Running
+			sync.unlock(&state.mutex)
+			_job_run(state, handle)
+			sync.lock(&state.mutex)
+			continue
+		}
+
+		// Help with other queued jobs before sleeping. This avoids deadlock when
+		// all workers are waiting on child jobs submitted by running jobs.
+		if helper_handle, _, got_job := _claim_next_locked(state); got_job {
+			sync.unlock(&state.mutex)
+			_job_run(state, helper_handle)
+			sync.lock(&state.mutex)
+			continue
+		}
+		sync.cond_wait(&state.job_changed, &state.mutex)
 	}
 
-	if job.result_size > 0 {
-		runtime.mem_copy_non_overlapping(res, &job.result_buff, int(job.result_size))
+	if final_job, valid := hm.dynamic_get(&state.jobs, handle); valid {
+		final_job.waiters -= 1
+		_maybe_reclaim_locked(state, handle, final_job)
 	}
-	return true
+
+	return
 }
-
