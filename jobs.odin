@@ -17,20 +17,20 @@ import "base:runtime"
 
 Job :: struct ($D, $R: typeid)
 	where size_of(D) <= size_of([2]u64),
-	      size_of(R) <= size_of([2]u64)
-	{id: Job_Id}
-
-Job_Id :: distinct int
+	      size_of(R) <= size_of([2]u64) {
+	procedure: rawptr,
+	data_buff: [2]u64,
+	data_size: u8,
+}
 
 Job_Internal :: struct {
-	id:          Job_Id,
 	procedure:   rawptr,
 	dispatch:    proc (^Job_Internal),
 	state:       Job_State, // atomic
-	data_size:   int,
 	data_buff:   [2]u64,
-	result_size: int,
 	result_buff: [2]u64,
+	data_size:   u8,
+	result_size: u8,
 }
 
 Job_State :: enum {Init, Ready, Running, Finished}
@@ -124,60 +124,61 @@ _job_dispatch_proc :: proc ($D, $R: typeid) -> proc (^Job_Internal) {
 		}
 		else when size_of(D) == 0 {
 			res := (proc () -> R)(job.procedure)()
-			runtime.mem_copy(&job.result_buff, &res, size_of(R))
+			runtime.mem_copy_non_overlapping(&job.result_buff, &res, size_of(R))
 		}
 		else when size_of(R) == 0 {
 			data: D
-			runtime.mem_copy(&data, &job.data_buff, size_of(D))
+			runtime.mem_copy_non_overlapping(&data, &job.data_buff, size_of(D))
 			(proc (D))(job.procedure)(data)
 		}
 		else {
 			data: D
-			runtime.mem_copy(&data, &job.data_buff, size_of(D))
+			runtime.mem_copy_non_overlapping(&data, &job.data_buff, size_of(D))
 			res := (proc (D) -> R)(job.procedure)(data)
-			runtime.mem_copy(&job.result_buff, &res, size_of(R))
+			runtime.mem_copy_non_overlapping(&job.result_buff, &res, size_of(R))
 		}
 	}
 }
 
-_job_is_equal :: proc (job: Job_Internal, procedure: rawptr, data: [2]u64, data_size: int) -> bool {
-	return job.procedure == procedure &&
-	       job.data_size == data_size &&
-	       job.data_buff == data
+_job_key :: proc (job: Job_Internal) -> Job(rawptr, rawptr) {
+	return Job(rawptr, rawptr){job.procedure, job.data_buff, job.data_size}
+}
+
+_job_is_equal :: proc (job: Job_Internal, procedure: rawptr, data: [2]u64, data_size: u8) -> bool {
+	return _job_key(job) == Job(rawptr, rawptr){procedure, data, data_size}
 }
 
 _job_raw :: proc (
 	state: ^Jobs_State,
 	procedure, data: rawptr,
-	data_size, result_size: int,
+	data_size, result_size: u8,
 	dispatch: proc (^Job_Internal),
 ) -> Job(rawptr, rawptr) {
 
 	data_buff: [2]u64
 	if data_size > 0 {
-		runtime.mem_copy(&data_buff, data, data_size)
+		runtime.mem_copy_non_overlapping(&data_buff, data, int(data_size))
 	}
 
 	for job in state.jobs {
 		_job_is_equal(job, procedure, data_buff, data_size) or_continue
 		assert(job.result_size == result_size)
-		return {id=job.id}
+		return _job_key(job)
 	}
 
 	context = state.ctx
 
-	id := Job_Id(len(state.jobs)+1)
-	append(&state.jobs, {
-		id          = id,
+	job := Job_Internal{
 		procedure   = procedure,
 		dispatch    = dispatch,
 		data_buff   = data_buff,
 		data_size   = data_size,
 		result_size = result_size,
 		state       = .Ready,
-	})
+	}
+	append(&state.jobs, job)
 
-	return {id=id}
+	return _job_key(job)
 }
 
 _job_execute :: proc (job: ^Job_Internal) -> bool {
@@ -194,19 +195,20 @@ _wait_raw :: proc (
 	state: ^Jobs_State, id: Job(rawptr, rawptr), res: rawptr,
 ) -> (found: bool) {
 	for &job in state.jobs {
-		if job.id == id.id {
-			if sync.atomic_load(&job.state) != .Finished {
-				if !_job_execute(&job) {
-					for sync.atomic_load(&job.state) != .Finished {
-						_do_work(state)
-					}
+		if _job_key(job) != id do continue
+
+		if sync.atomic_load(&job.state) != .Finished {
+			if !_job_execute(&job) {
+				for sync.atomic_load(&job.state) != .Finished {
+					_do_work(state)
 				}
 			}
-			if job.result_size > 0 {
-				runtime.mem_copy(res, &job.result_buff, job.result_size)
-			}
-			return true
 		}
+
+		if job.result_size > 0 {
+			runtime.mem_copy_non_overlapping(res, &job.result_buff, int(job.result_size))
+		}
+		return true
 	}
 
 	// Not found
