@@ -27,6 +27,7 @@ Job_State :: enum u8 {Init, Ready, Running, Finished, Released}
 
 Jobs_State :: struct {
 	ctx:     runtime.Context,
+	mutex:   sync.Mutex,
 	jobs:    map[Job(rawptr)]Job_Internal,
 	threads: []^thread.Thread,
 	done:    bool, // atomic
@@ -108,10 +109,15 @@ _thread_proc :: proc () {
 }
 
 _do_work :: proc (state: ^Jobs_State) {
-	for _, &j in state.jobs {
-		_job_execute(state, &j) or_continue
-		break
+	sync.lock(&state.mutex)
+	for _, &job in state.jobs {
+		if sync.atomic_load(&job.state) == .Ready {
+			sync.unlock(&state.mutex)
+			_job_execute(state, &job)
+			return
+		}
 	}
+	sync.unlock(&state.mutex)
 }
 
 _job_dispatch_proc :: proc ($D, $R: typeid) -> proc (^Job_Internal) {
@@ -140,41 +146,58 @@ _job_dispatch_proc :: proc ($D, $R: typeid) -> proc (^Job_Internal) {
 _job_execute :: proc (state: ^Jobs_State, job: ^Job_Internal) -> bool {
 	genration := sync.atomic_load(&job.generation)
 	sync.atomic_compare_exchange_strong(&job.state, .Ready, .Running) or_return
+
 	context = state.ctx
 	job->dispatch()
+
 	if genration == sync.atomic_load(&job.generation) {
 		sync.atomic_store(&job.state, .Finished)
-	} else if job.to_release {
-		delete_key(&state.jobs, _job_key(job^))
+	} else if sync.atomic_load(&job.to_release) {
+		sync.atomic_store(&job.state, .Released)
+		_job_remove(state, _job_key(job^))
 	}
 	return true
 }
 
 _job_key_release :: proc (state: ^Jobs_State, id: Job(rawptr)) {
-	if job, in_cache := (&state.jobs[id]); in_cache {
+	if job, in_cache := _job_get(state, id); in_cache {
 		_job_release(state, job)
 	}
 }
 _job_release :: proc (state: ^Jobs_State, job: ^Job_Internal) {
-	job.to_release = true
+	sync.atomic_store(&job.to_release, true)
 	if _, finished := sync.atomic_compare_exchange_strong(&job.state, .Finished, .Released); finished {
-		delete_key(&state.jobs, _job_key(job^))
+		_job_remove(state, _job_key(job^))
 	}
 }
 
 _job_key_invalidate :: proc (state: ^Jobs_State, id: Job(rawptr)) {
-	if job, in_cache := (&state.jobs[id]); in_cache {
+	if job, in_cache := _job_get(state, id); in_cache {
 		_job_invalidate(state, job)
 	}
 }
 _job_invalidate :: proc (state: ^Jobs_State, job: ^Job_Internal) {
 	sync.atomic_add(&job.generation, 1)
-	job.to_release = true
+	sync.atomic_store(&job.to_release, true)
 	if _, finished := sync.atomic_compare_exchange_strong(&job.state, .Finished, .Released); finished {
-		delete_key(&state.jobs, _job_key(job^))
+		_job_remove(state, _job_key(job^))
 	} else if _, ready := sync.atomic_compare_exchange_strong(&job.state, .Ready, .Released); ready {
-		delete_key(&state.jobs, _job_key(job^))
+		_job_remove(state, _job_key(job^))
 	}
+}
+
+_job_get :: proc (state: ^Jobs_State, id: Job(rawptr)) -> (^Job_Internal, bool) {
+	sync.guard(&state.mutex)
+	return &state.jobs[id]
+}
+_job_add :: proc (state: ^Jobs_State, job: Job_Internal) -> Job(rawptr) {
+	sync.guard(&state.mutex)
+	state.jobs[_job_key(job)] = job
+	return _job_key(job)
+}
+_job_remove :: proc (state: ^Jobs_State, id: Job(rawptr)) {
+	sync.guard(&state.mutex)
+	delete_key(&state.jobs, id)
 }
 
 _job_key :: proc (job: Job_Internal) -> Job(rawptr) {
@@ -193,33 +216,30 @@ _job_raw :: proc (
 		runtime.mem_copy_non_overlapping(&data_buff, data, int(data_size))
 	}
 
-	if job, cached := (&state.jobs[{procedure, data_buff, data_size}]); cached {
+	if job, cached := _job_get(state, {procedure, data_buff, data_size}); cached {
 		assert(job.result_size == result_size)
-		job.to_release = false
+		sync.atomic_store(&job.to_release, false)
 		return {procedure, data_buff, data_size}
 	}
 
-	job := Job_Internal{
+	return _job_add(state, {
 		procedure   = procedure,
 		dispatch    = dispatch,
 		data_buff   = data_buff,
 		data_size   = data_size,
 		result_size = result_size,
 		state       = .Ready,
-	}
-	state.jobs[_job_key(job)] = job
-
-	return _job_key(job)
+	})
 }
 
 _wait_raw :: proc (
 	state: ^Jobs_State, id: Job(rawptr), res: rawptr,
 ) -> (found: bool) {
-	job := (&state.jobs[id]) or_return
+	job := _job_get(state, id) or_return
 
-	if sync.atomic_load(&job.state) != .Finished {
+	if sync.atomic_load(&job.state) < .Finished {
 		if !_job_execute(state, job) {
-			for sync.atomic_load(&job.state) != .Finished {
+			for sync.atomic_load(&job.state) < .Finished {
 				_do_work(state)
 			}
 		}
