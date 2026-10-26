@@ -5,9 +5,7 @@ import "core:sync"
 import "core:os"
 import "core:thread"
 
-Job :: struct ($D, $R: typeid)
-	where size_of(D) <= size_of([2]u64),
-	      size_of(R) <= size_of([2]u64) {
+Job :: struct ($R: typeid) where size_of(R) <= size_of([2]u64) {
 	procedure: rawptr,
 	data_buff: [2]u64,
 	data_size: u8,
@@ -27,7 +25,7 @@ Job_State :: enum u8 {Init, Ready, Running, Finished}
 
 Jobs_State :: struct {
 	ctx:     runtime.Context,
-	jobs:    map[Job(rawptr, rawptr)]Job_Internal,
+	jobs:    map[Job(rawptr)]Job_Internal,
 	threads: []^thread.Thread,
 	done:    bool, // atomic
 }
@@ -35,7 +33,7 @@ Jobs_State :: struct {
 init :: proc (state: ^Jobs_State, allocator := context.allocator, loc := #caller_location) {
 
 	state.ctx     = context
-	state.jobs    = make(map[Job(rawptr, rawptr)]Job_Internal, 1000, allocator, loc)
+	state.jobs    = make(map[Job(rawptr)]Job_Internal, 1000, allocator, loc)
 	state.threads = make([]^thread.Thread, os.get_processor_core_count()-1, allocator, loc)
 
 	context.user_ptr = state
@@ -58,7 +56,7 @@ fini :: proc (state: ^Jobs_State) {
 
 job_data_result :: proc (
 	state: ^Jobs_State, procedure: proc ($D) -> $R, data: D,
-) -> (job: Job(D, R)) where
+) -> (job: Job(R)) where
 	size_of(D) <= size_of([2]u64),
 	size_of(R) <= size_of([2]u64) {
 	data := data
@@ -66,26 +64,26 @@ job_data_result :: proc (
 }
 job_no_data_result :: proc (
 	state: ^Jobs_State, procedure: proc () -> $R,
-) -> (job: Job(struct {}, R)) where
+) -> (job: Job(R)) where
 	size_of(R) <= size_of([2]u64) {
 	return auto_cast _job_raw(state, auto_cast procedure, nil, 0, size_of(R), _job_dispatch_proc(struct {}, R))
 }
 job_data_no_result :: proc (
 	state: ^Jobs_State, procedure: proc ($D), data: D,
-) -> (job: Job(D, struct {})) where
+) -> (job: Job(struct {})) where
 	size_of(D) <= size_of([2]u64) {
 	data := data
 	return auto_cast _job_raw(state, auto_cast procedure, &data, size_of(D), 0, _job_dispatch_proc(D, struct {}))
 }
 job_no_data_no_result :: proc (
 	state: ^Jobs_State, procedure: proc (),
-) -> (job: Job(struct {}, struct {})) {
+) -> (job: Job(struct {})) {
 	return auto_cast _job_raw(state, auto_cast procedure, nil, 0, 0, _job_dispatch_proc(struct {}, struct {}))
 }
 
 job :: proc {job_data_result, job_no_data_result, job_data_no_result, job_no_data_no_result}
 
-wait :: proc (state: ^Jobs_State, id: Job($D, $R)) -> (res: R, found: bool) #optional_ok {
+wait :: proc (state: ^Jobs_State, id: Job($R)) -> (res: R, found: bool) #optional_ok {
 	found = _wait_raw(state, auto_cast id, &res)
 	return
 }
@@ -130,8 +128,8 @@ _job_dispatch_proc :: proc ($D, $R: typeid) -> proc (^Job_Internal) {
 	}
 }
 
-_job_key :: proc (job: Job_Internal) -> Job(rawptr, rawptr) {
-	return Job(rawptr, rawptr){job.procedure, job.data_buff, job.data_size}
+_job_key :: proc (job: Job_Internal) -> Job(rawptr) {
+	return Job(rawptr){job.procedure, job.data_buff, job.data_size}
 }
 
 _job_raw :: proc (
@@ -139,7 +137,7 @@ _job_raw :: proc (
 	procedure, data: rawptr,
 	data_size, result_size: u8,
 	dispatch: proc (^Job_Internal),
-) -> Job(rawptr, rawptr) {
+) -> Job(rawptr) {
 
 	data_buff: [2]u64
 	if data_size > 0 {
@@ -178,7 +176,7 @@ _job_execute :: proc (job: ^Job_Internal) -> bool {
 }
 
 _wait_raw :: proc (
-	state: ^Jobs_State, id: Job(rawptr, rawptr), res: rawptr,
+	state: ^Jobs_State, id: Job(rawptr), res: rawptr,
 ) -> (found: bool) {
 	for job_id, &job in state.jobs {
 		if job_id != id do continue

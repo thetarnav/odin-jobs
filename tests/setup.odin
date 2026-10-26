@@ -34,7 +34,7 @@ test_basic :: proc (t: ^testing.T) {
 
 	{
 		count: int
-		js: [dynamic]jobs.Job(^int, struct {})
+		js: [dynamic]jobs.Job(struct {})
 		js.allocator = context.temp_allocator
 
 		for _ in 0..<5 {
