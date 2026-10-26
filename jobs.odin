@@ -37,7 +37,7 @@ Job_State :: enum {Init, Ready, Running, Finished}
 
 Jobs_State :: struct {
 	ctx:     runtime.Context,
-	jobs:    [dynamic]Job_Internal,
+	jobs:    map[Job(rawptr, rawptr)]Job_Internal,
 	threads: []^thread.Thread,
 	done:    bool, // atomic
 }
@@ -45,7 +45,7 @@ Jobs_State :: struct {
 init :: proc (state: ^Jobs_State, allocator := context.allocator, loc := #caller_location) {
 
 	state.ctx     = context
-	state.jobs    = make([dynamic]Job_Internal, 0, 1000, allocator, loc)
+	state.jobs    = make(map[Job(rawptr, rawptr)]Job_Internal, 1000, allocator, loc)
 	state.threads = make([]^thread.Thread, os.get_processor_core_count()-1, allocator, loc)
 
 	context.user_ptr = state
@@ -55,7 +55,7 @@ init :: proc (state: ^Jobs_State, allocator := context.allocator, loc := #caller
 	}
 }
 fini :: proc (state: ^Jobs_State) {
-	for &j in state.jobs {
+	for _, &j in state.jobs {
 		_job_execute(&j)
 	}
 	sync.atomic_store(&state.done, true)
@@ -111,7 +111,7 @@ _thread_proc :: proc () {
 }
 
 _do_work :: proc (state: ^Jobs_State) {
-	for &j in state.jobs {
+	for _, &j in state.jobs {
 		_job_execute(&j) or_continue
 		break
 	}
@@ -144,10 +144,6 @@ _job_key :: proc (job: Job_Internal) -> Job(rawptr, rawptr) {
 	return Job(rawptr, rawptr){job.procedure, job.data_buff, job.data_size}
 }
 
-_job_is_equal :: proc (job: Job_Internal, procedure: rawptr, data: [2]u64, data_size: u8) -> bool {
-	return _job_key(job) == Job(rawptr, rawptr){procedure, data, data_size}
-}
-
 _job_raw :: proc (
 	state: ^Jobs_State,
 	procedure, data: rawptr,
@@ -160,10 +156,10 @@ _job_raw :: proc (
 		runtime.mem_copy_non_overlapping(&data_buff, data, int(data_size))
 	}
 
-	for job in state.jobs {
-		_job_is_equal(job, procedure, data_buff, data_size) or_continue
+	for id, job in state.jobs {
+		if id != {procedure, data_buff, data_size} do continue
 		assert(job.result_size == result_size)
-		return _job_key(job)
+		return id
 	}
 
 	context = state.ctx
@@ -176,7 +172,7 @@ _job_raw :: proc (
 		result_size = result_size,
 		state       = .Ready,
 	}
-	append(&state.jobs, job)
+	state.jobs[_job_key(job)] = job
 
 	return _job_key(job)
 }
@@ -194,8 +190,8 @@ _job_execute :: proc (job: ^Job_Internal) -> bool {
 _wait_raw :: proc (
 	state: ^Jobs_State, id: Job(rawptr, rawptr), res: rawptr,
 ) -> (found: bool) {
-	for &job in state.jobs {
-		if _job_key(job) != id do continue
+	for job_id, &job in state.jobs {
+		if job_id != id do continue
 
 		if sync.atomic_load(&job.state) != .Finished {
 			if !_job_execute(&job) {
